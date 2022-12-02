@@ -24,12 +24,14 @@ from datetime import timedelta
 
 import torch
 import torch.distributed as dist
+import tensorrt as trt
+import ctypes
 
 from tqdm import tqdm
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
 
-import sys 
+import sys
 sys.path.insert(0, "./ViT-pytorch")
 from models.modeling import CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -151,7 +153,7 @@ def valid(args, config, model, test_loader):
         acc1_meter.update(acc1.item(), y.size(0))
         acc5_meter.update(acc5.item(), y.size(0))
 
-        
+
         if step % config.PRINT_FREQ == 0:
             logger.info(
                 f'Test: [{step}/{len(test_loader)}]\t'
@@ -166,7 +168,7 @@ def calib(args, config, model):
     """ Calibrate the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
-    
+
     dataset_train, dataset_val, train_loader, test_loader = build_loader(config, args)
     # Calibration
     quant_utils.configure_model(model, args, calib=True)
@@ -193,6 +195,109 @@ def calib(args, config, model):
     torch.save(model.state_dict(), output_model_path)
     logger.info(f'Model is saved to {output_model_path}')
 
+def validate_trt(args, config):
+    num_classes = 1000
+    model_config = CONFIGS[args.model_type]
+    model = VisionTransformerINT8(model_config, args.img_size, zero_head=False, num_classes=num_classes)
+    model_ckpt = torch.load(args.pretrained_dir, map_location="cpu")
+    model.load_state_dict(model_ckpt["model"] if "model" in model_ckpt else model_ckpt, strict=False)
+    model.cuda()
+    model.eval()
+    quant_utils.configure_model(model, args, calib=False)
+
+    dataset_train, dataset_val, train_loader, test_loader = build_loader(config, args)
+
+    # Validation!
+    eval_losses = AverageMeter()
+
+    logger.info("***** Running Validation *****")
+    logger.info("  Num steps = %d", len(test_loader))
+    logger.info("  Batch size = %d", args.eval_batch_size)
+
+    # _, test_loader = get_loader(args)
+
+    model.eval()
+    all_preds, all_label = [], []
+    epoch_iterator = tqdm(test_loader,
+                          desc="Validating... (loss=X.X)",
+                          bar_format="{l_bar}{r_bar}",
+                          dynamic_ncols=True,
+                          disable=args.local_rank not in [-1, 0])
+    loss_fct = torch.nn.CrossEntropyLoss()
+    print('Eval batchsize', args.eval_batch_size)
+    # Import necessary plugins for BERT TensorRT
+    plugin_path = "/workspace/FasterTransformer/build/lib/libvit_plugin.so"
+    # handle = ctypes.CDLL(plugin_path, mode=ctypes.RTLD_GLOBAL)
+    trtlogger = trt.Logger(trt.Logger.ERROR)
+    trt.init_libnvinfer_plugins(trtlogger, '')
+
+    ctypes.cdll.LoadLibrary(plugin_path)
+    # if not handle:
+    #     raise RuntimeError("Fail to load plugin library: %s" % plugin_path)
+    with open(args.engine, 'rb') as f, trt.Runtime(trt.Logger(trt.Logger.INFO)) as runtime,\
+        runtime.deserialize_cuda_engine(f.read()) as engine, engine.create_execution_context() as context:
+        if engine == None:
+            print('engine is None')
+
+        context.active_optimization_profile = 0
+        stream = 0 #torch.cuda.Stream()
+
+        context.set_binding_shape(0, (args.eval_batch_size, 3, args.img_size, args.img_size))
+
+        output_shape = tuple(context.get_binding_shape(1))
+        print(output_shape)
+
+        d_output = torch.empty(output_shape, dtype=torch.float32).cuda()
+        for idx, (images, target) in enumerate(epoch_iterator):
+            images_half = torch.tensor(images, dtype=torch.half)
+            images_half = images_half.cuda(non_blocking=True)
+            images = images.cuda(non_blocking=True)
+            target = target.cuda(non_blocking=True)
+            # print(images.shape)
+            
+            context.execute_async_v2([images_half.data_ptr()] + [d_output.data_ptr()], stream)
+            torch.cuda.synchronize()
+            
+            # torch_embed = model.transformer(images)
+            # torch.save(images_half, 'images_half.pt')
+            # torch.save(d_output, 'd_output2.pt')
+            # torch.save(torch_embed, 'torch_embed.pt')
+            # exit(0)
+            with torch.no_grad():
+                logits = model.head(d_output.float()[:, 0])
+
+                # torch_pred, _ = model(images)
+                # if step % 10 == 0:
+                #     diff = abs(torch_pred - logits)
+                #     print(diff.shape, diff.mean(1))
+
+            eval_loss = loss_fct(logits, target)
+            eval_losses.update(eval_loss.item())
+
+            preds = torch.argmax(logits, dim=-1)
+
+            if len(all_preds) == 0:
+                all_preds.append(preds.detach().cpu().numpy())
+                all_label.append(target.detach().cpu().numpy())
+            else:
+                all_preds[0] = np.append(
+                    all_preds[0], preds.detach().cpu().numpy(), axis=0
+                )
+                all_label[0] = np.append(
+                    all_label[0], target.detach().cpu().numpy(), axis=0
+                )
+            epoch_iterator.set_description("Validating... (loss=%2.5f)" % eval_losses.val)
+
+    all_preds, all_label = all_preds[0], all_label[0]
+    accuracy = simple_accuracy(all_preds, all_label)
+
+    logger.info("\n")
+    logger.info("Validation Results")
+    logger.info("Valid Loss: %2.5f" % eval_losses.avg)
+    logger.info("Valid Accuracy: %2.5f" % accuracy)
+
+    return accuracy
+
 def train(args, config):
     num_classes = 1000
     model_config = CONFIGS[args.model_type]
@@ -201,7 +306,7 @@ def train(args, config):
     model.load_state_dict(model_ckpt["model"] if "model" in model_ckpt else model_ckpt, strict=False)
     model.cuda()
     model.train()
-    
+
     teacher = None
     dis_loss = None
     if args.distill:
@@ -227,7 +332,7 @@ def train(args, config):
                                 lr=args.qat_lr,
                                 momentum=0.9,
                                 weight_decay=args.weight_decay)
-    
+
     print('args.qat_lr: %.6f' % (args.qat_lr))
     print('optimizer.lr: %.6f' % optimizer.state_dict()['param_groups'][0]['lr'])
     t_total = args.num_steps
@@ -236,7 +341,7 @@ def train(args, config):
     # else:
     #     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    
+
     print('查看optimizer.param_groups结构:')
     i_list=[i for i in optimizer.param_groups[0].keys()]
     print(i_list)
@@ -271,7 +376,7 @@ def train(args, config):
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
-        
+
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
             x, y = batch
@@ -304,10 +409,10 @@ def train(args, config):
                 global_step += 1
 
                 epoch_iterator.set_description(
-                    "EPOCH [%d/%d] (%d / %d Steps) (loss=%2.5f) (lr=%.7f)" % 
+                    "EPOCH [%d/%d] (%d / %d Steps) (loss=%2.5f) (lr=%.7f)" %
                         (epoch_i, args.num_epochs, global_step, len(epoch_iterator), losses.val, lr)
                 )
-        
+
         if args.local_rank in [-1, 0]:
             accuracy = valid(args, config, model, test_loader)
             if best_acc < accuracy:
@@ -370,12 +475,14 @@ def parse_option():
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where checkpoints will be written.")
+    parser.add_argument("--engine", type=str,
+                        help="The directory of vit tensorrt engine.")
 
     parser.add_argument("--img_size", default=384, type=int,
                         help="Resolution size")
     parser.add_argument("--train_batch_size", default=64, type=int,
                         help="Total batch size for training.")
-    parser.add_argument("--eval_batch_size", default=64, type=int,
+    parser.add_argument("--eval_batch_size", default=32, type=int,
                         help="Total batch size for eval.")
     parser.add_argument("--eval_every", default=2000, type=int,
                         help="Run prediction on validation set every so many steps."
@@ -421,7 +528,7 @@ def parse_option():
 
 
 def main():
-    
+
     args, config = parse_option()
     # print(config.dump())
 
@@ -447,11 +554,14 @@ def main():
     # Set seed
     set_seed(args)
 
+    if args.engine:
+        validate_trt(args, config)
+
     # Calibration
     if args.calib:
         args, model = setup(args)
         calib(args, config, model)
-    
+
     # Quantization-Aware Training
     if args.train:
         # args, model = setup(args)
