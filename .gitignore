@@ -22,3 +22,6 @@ mlruns/
 # IDE
 .vscode/
 .idea/
+
+#MLFLOW
+.db
