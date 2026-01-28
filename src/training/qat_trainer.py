@@ -1,8 +1,11 @@
-# project/src/training/qat_trainer.py
 #!/usr/bin/env python
 """
 Final QAT training with DDP using best hyperparameters from Optuna search.
 Produces deployable INT8 quantized model.
+
+Notes:
+- Eager QAT/convert are CPU-oriented for true int8 execution; we evaluate the converted model on CPU.
+- prepare_qat requires the model to be in train() mode.
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-# Torch quantization helpers
+# Torch quantization helpers (deprecated long-term, but functional today)
 from torch.ao.quantization import convert, get_default_qat_qconfig, prepare_qat
 
 # Fix import path (repo-root style)
@@ -30,40 +33,44 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from src.models import model_registry  # noqa: E402
 
 
+@torch.no_grad()
 def evaluate_fp32(model: nn.Module, dataloader: DataLoader, device: torch.device) -> float:
     """Evaluate (fake-quant or fp32) on the given device."""
     model.eval()
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in dataloader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            outputs = model(images)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+    for images, labels in dataloader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        outputs = model(images)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
     return 100.0 * correct / max(1, total)
 
 
+@torch.no_grad()
 def evaluate_quantized_cpu(quant_model: nn.Module, dataloader: DataLoader) -> float:
     """
     Evaluate a REAL quantized model.
-    Note: eager-mode INT8 quantized ops are CPU-oriented; evaluate on CPU.
+    Eager-mode quantized ops are CPU-oriented; evaluate on CPU.
     """
     quant_model.eval()
     quant_model.to("cpu")
     correct = 0
     total = 0
-    with torch.no_grad():
-        for images, labels in dataloader:
-            images = images.to("cpu")
-            labels = labels.to("cpu")
-            outputs = quant_model(images)
-            preds = outputs.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+    for images, labels in dataloader:
+        images = images.to("cpu")
+        labels = labels.to("cpu")
+        outputs = quant_model(images)
+        preds = outputs.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
     return 100.0 * correct / max(1, total)
+
+
+def _unwrap_ddp(m: nn.Module) -> nn.Module:
+    return m.module if hasattr(m, "module") else m
 
 
 def main() -> None:
@@ -78,7 +85,6 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
-
     is_distributed = world_size > 1
 
     if torch.cuda.is_available():
@@ -121,17 +127,15 @@ def main() -> None:
         ]
     )
 
-    # download only on rank 0, then barrier
     trainset = datasets.CIFAR10(root="./data", train=True, download=(rank == 0), transform=transform)
     testset = datasets.CIFAR10(root="./data", train=False, download=(rank == 0), transform=transform)
 
     if is_distributed:
         dist.barrier()
 
-    if is_distributed:
-        train_sampler = DistributedSampler(trainset, num_replicas=world_size, rank=rank, shuffle=True)
-    else:
-        train_sampler = None
+    train_sampler = (
+        DistributedSampler(trainset, num_replicas=world_size, rank=rank, shuffle=True) if is_distributed else None
+    )
 
     trainloader = DataLoader(
         trainset,
@@ -143,7 +147,6 @@ def main() -> None:
         persistent_workers=True,
     )
 
-    # For GPU eval (fp32/fake-quant)
     testloader_gpu = DataLoader(
         testset,
         batch_size=int(hparams["batch_size"]),
@@ -164,76 +167,79 @@ def main() -> None:
     )
 
     # ---- Models ----
-    teacher = model_registry.create_teacher("vit", num_classes=10).to(device).eval()
-    student = model_registry.create_student("vit", num_classes=10, qat_wrapper=True).to(device)
-
-    # Wrap teacher in no-grad always
+    teacher = model_registry.create_teacher("vit", num_classes=10).to(device)
+    teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # ---- Training setup (pre-DDP) ----
+    # QAT wrapper student (QuantStub -> model -> DeQuantStub)
+    model: nn.Module = model_registry.create_student("vit", num_classes=10, qat_wrapper=True).to(device)
+
+    # ---- Losses ----
     criterion_ce = nn.CrossEntropyLoss(label_smoothing=float(hparams["label_smoothing"]))
     criterion_kd = nn.KLDivLoss(reduction="batchmean")
 
-    def make_optimizer(params):
+    kd_temp = float(hparams["kd_temp"])
+    kd_alpha = float(hparams["kd_alpha"])
+
+    # ---- Optimizer ----
+    def make_optimizer(params, lr_scale: float = 1.0):
         return torch.optim.AdamW(
             params,
-            lr=float(hparams["lr"]),
+            lr=float(hparams["lr"]) * lr_scale,
             weight_decay=float(hparams["weight_decay"]),
         )
 
-    optimizer = make_optimizer(student.parameters())
+    optimizer = make_optimizer(model.parameters(), lr_scale=1.0)
 
-    # DDP wrapper is applied ONCE for each "model version":
-    model: nn.Module = student
-    ddp_model: nn.Module
+    # ---- DDP wrap (initial) ----
+    if is_distributed:
+        ddp_model: nn.Module = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+    else:
+        ddp_model = model
 
     qat_enabled = False
     best_quant_acc = 0.0
 
-    # Initial DDP wrap (non-QAT)
-    if is_distributed:
-        ddp_model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
-    else:
-        ddp_model = model
+    epochs = int(hparams["epochs"])
+    qat_start_epoch = int(hparams["qat_start_epoch"])
+    qbackend = str(hparams.get("qat_backend", "qnnpack"))
 
-    for epoch in range(int(hparams["epochs"])):
+    for epoch in range(epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        # Enable QAT at configured epoch (create a NEW model graph, then wrap with DDP once)
-        if (not qat_enabled) and (epoch >= int(hparams["qat_start_epoch"])):
+        # ---- Enable QAT once ----
+        if (not qat_enabled) and (epoch >= qat_start_epoch):
             if rank == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Enabling QAT at epoch {epoch}")
 
-            # Choose qconfig for deployment target; qnnpack is common for ARM/Jetson
-            qbackend = str(hparams.get("qat_backend", "qnnpack"))
-            model.qconfig = get_default_qat_qconfig(qbackend)
+            # unwrap DDP -> prepare -> rewrap
+            base = _unwrap_ddp(ddp_model)
 
-            # prepare_qat should occur before DDP wrapping
-            model = prepare_qat(model, inplace=False).to(device)
+            # prepare_qat requires train mode
+            base.train()
 
-            # Re-wrap DDP for the new prepared model
+            base.qconfig = get_default_qat_qconfig(qbackend)
+            prepared = prepare_qat(base, inplace=False).to(device)
+            prepared.train()
+
+            # rewrap DDP for prepared model
             if is_distributed:
-                ddp_model = DDP(model, device_ids=[local_rank] if device.type == "cuda" else None)
+                ddp_model = DDP(prepared, device_ids=[local_rank] if device.type == "cuda" else None)
             else:
-                ddp_model = model
+                ddp_model = prepared
 
-            # Often reduce LR when QAT begins
-            optimizer = torch.optim.AdamW(
-                ddp_model.parameters(),
-                lr=float(hparams["lr"]) * 0.5,
-                weight_decay=float(hparams["weight_decay"]),
-            )
+            # reduce lr when QAT starts
+            optimizer = make_optimizer(ddp_model.parameters(), lr_scale=0.5)
+
             qat_enabled = True
 
         ddp_model.train()
-        epoch_loss = 0.0
 
-        # tqdm only on rank 0
         it = trainloader
         if rank == 0:
-            it = tqdm(trainloader, desc=f"Epoch {epoch+1}/{int(hparams['epochs'])}", leave=False)
+            it = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
 
         for images, labels in it:
             images = images.to(device, non_blocking=True)
@@ -245,9 +251,6 @@ def main() -> None:
             student_out = ddp_model(images)
 
             loss_ce = criterion_ce(student_out, labels)
-            kd_temp = float(hparams["kd_temp"])
-            kd_alpha = float(hparams["kd_alpha"])
-
             loss_kd = criterion_kd(
                 torch.log_softmax(student_out / kd_temp, dim=1),
                 torch.softmax(teacher_out / kd_temp, dim=1),
@@ -260,36 +263,35 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
             optimizer.step()
 
-            epoch_loss += float(loss.item())
-
         if is_distributed:
             dist.barrier()
 
         # ---- Validation + checkpoint (rank 0 only) ----
         if rank == 0:
-            # QAT/fp32 accuracy on GPU device
             qat_acc = evaluate_fp32(ddp_model, testloader_gpu, device)
 
             quant_acc = qat_acc
-            is_last = epoch == (int(hparams["epochs"]) - 1)
+            is_last = epoch == (epochs - 1)
 
             if is_last:
-                # Convert eager quant model and evaluate on CPU (real int8 path)
-                base = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
+                base = _unwrap_ddp(ddp_model)
+                # convert expects eval mode
+                base.eval()
                 quant_model = convert(base, inplace=False)
                 quant_acc = evaluate_quantized_cpu(quant_model, testloader_cpu)
 
-            # Save best
+            # Save best (based on quant_acc)
             if quant_acc > best_quant_acc:
                 best_quant_acc = quant_acc
-                base = ddp_model.module if hasattr(ddp_model, "module") else ddp_model
+                base = _unwrap_ddp(ddp_model)
                 torch.save(base.state_dict(), output_dir / "best_qat.pth")
                 if is_last:
+                    base.eval()
                     torch.save(convert(base, inplace=False).state_dict(), output_dir / "best_converted.pth")
 
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
-                f"Epoch {epoch+1:2d}/{int(hparams['epochs'])} | "
+                f"Epoch {epoch+1:2d}/{epochs} | "
                 f"QAT Acc: {qat_acc:5.2f}% | Quant Acc: {quant_acc:5.2f}%"
             )
 
@@ -308,7 +310,7 @@ def main() -> None:
         print("=" * 70)
 
         mlflow.log_metric("final_quant_acc", best_quant_acc)
-        # artifacts may not exist if last epoch didn't improve; guard
+
         converted = output_dir / "best_converted.pth"
         if converted.exists():
             mlflow.log_artifact(str(converted), "models")

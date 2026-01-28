@@ -114,10 +114,21 @@ def run_optuna_search(cfg: SearchConfig) -> Dict:
         # lightweight training loop
         for epoch in range(epochs):
             if (not qat_enabled) and (epoch >= qat_start_epoch):
-                model.qconfig = torch.ao.quantization.get_default_qat_qconfig("qnnpack")
+                # prepare_qat requires train() mode
+                model.train()
+
+                # backend used for observer/fake-quant defaults
+                backend = "qnnpack"
+                model.qconfig = torch.ao.quantization.get_default_qat_qconfig(backend)
+
+                # IMPORTANT: prepare_qat expects qconfig set and model in train()
                 model = torch.ao.quantization.prepare_qat(model, inplace=False).to(device)
+                model.train()
+
+                # Often reduce LR once QAT starts
                 opt = torch.optim.AdamW(model.parameters(), lr=float(lr) * 0.5, weight_decay=float(weight_decay))
                 qat_enabled = True
+
 
             model.train()
             it = tqdm(trainloader, desc=f"trial {trial.number} ep {epoch+1}/{epochs}", leave=False)
