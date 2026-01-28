@@ -3,10 +3,9 @@
 Final QAT training with DDP using best hyperparameters from Optuna search.
 Produces deployable INT8 quantized model.
 
-Notes:
-- Eager QAT/convert are CPU-oriented for true int8 execution; we evaluate the converted model on CPU.
-- prepare_qat requires the model to be in train() mode.
-- AMP is supported pre-QAT only; AMP is disabled once QAT starts (fixes dtype issues with fake-quant).
+Updates:
+- If --config is not provided or missing, uses sane defaults.
+- AMP supported pre-QAT only; disabled once QAT starts (avoids fake-quant dtype issues).
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
 
 import mlflow
 import torch
@@ -26,7 +26,6 @@ from torch.utils.data import DataLoader, DistributedSampler
 from torchvision import datasets, transforms
 from tqdm import tqdm
 
-# Torch quantization helpers (deprecated long-term, but functional today)
 from torch.ao.quantization import convert, get_default_qat_qconfig, prepare_qat
 
 # Fix import path (repo-root style)
@@ -34,9 +33,21 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from src.models import model_registry  # noqa: E402
 
 
+DEFAULT_HPARAMS: Dict[str, Any] = {
+    "lr": 1.5e-4,
+    "weight_decay": 1e-3,
+    "label_smoothing": 0.1,
+    "kd_temp": 4.0,
+    "kd_alpha": 0.5,
+    "qat_start_epoch": 2,
+    "epochs": 10,
+    "batch_size": 256,
+    "qat_backend": "qnnpack",
+}
+
+
 @torch.no_grad()
 def evaluate_fp32(model: nn.Module, dataloader: DataLoader, device: torch.device) -> float:
-    """Evaluate (fake-quant or fp32) on the given device."""
     model.eval()
     correct = 0
     total = 0
@@ -52,10 +63,6 @@ def evaluate_fp32(model: nn.Module, dataloader: DataLoader, device: torch.device
 
 @torch.no_grad()
 def evaluate_quantized_cpu(quant_model: nn.Module, dataloader: DataLoader) -> float:
-    """
-    Evaluate a REAL quantized model.
-    Eager-mode quantized ops are CPU-oriented; evaluate on CPU.
-    """
     quant_model.eval()
     quant_model.to("cpu")
     correct = 0
@@ -74,11 +81,44 @@ def _unwrap_ddp(m: nn.Module) -> nn.Module:
     return m.module if hasattr(m, "module") else m
 
 
+def _load_hparams(config_path: Optional[str]) -> Dict[str, Any]:
+    h = dict(DEFAULT_HPARAMS)
+
+    if config_path:
+        p = Path(config_path)
+        if p.exists() and p.is_file():
+            with open(p, "r") as f:
+                loaded = yaml.safe_load(f) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError(f"Invalid YAML format in {config_path}; expected mapping/dict.")
+            h.update(loaded)
+        else:
+            print(f"[WARN] Config file not found: {config_path}. Using DEFAULT_HPARAMS.")
+
+    # basic normalization / type casting
+    h["lr"] = float(h["lr"])
+    h["weight_decay"] = float(h["weight_decay"])
+    h["label_smoothing"] = float(h["label_smoothing"])
+    h["kd_temp"] = float(h["kd_temp"])
+    h["kd_alpha"] = float(h["kd_alpha"])
+    h["qat_start_epoch"] = int(h["qat_start_epoch"])
+    h["epochs"] = int(h["epochs"])
+    h["batch_size"] = int(h["batch_size"])
+    h["qat_backend"] = str(h.get("qat_backend", "qnnpack"))
+
+    return h
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Final QAT training with DDP")
-    parser.add_argument("--config", type=str, required=True, help="Path to best_params.yaml")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to best_params.yaml. If omitted or missing, defaults are used.",
+    )
     parser.add_argument("--output-dir", type=str, default="./qat_search", help="Output directory")
 
     # Optional AMP for speed (pre-QAT only)
@@ -87,6 +127,17 @@ def main() -> None:
     # MLflow backend (recommend sqlite)
     parser.add_argument("--mlflow-uri", type=str, default="sqlite:///mlflow.db")
     parser.add_argument("--mlflow-exp", type=str, default="clue-vit-qat-final")
+
+    # Optional overrides (work even when config provided)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--qat-start-epoch", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None)
+    parser.add_argument("--label-smoothing", type=float, default=None)
+    parser.add_argument("--kd-temp", type=float, default=None)
+    parser.add_argument("--kd-alpha", type=float, default=None)
+    parser.add_argument("--qat-backend", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -107,12 +158,37 @@ def main() -> None:
     if is_distributed and not dist.is_initialized():
         dist.init_process_group(backend=backend)
 
-    # ---- Load hyperparameters ----
-    with open(args.config, "r") as f:
-        hparams = yaml.safe_load(f)
+    # ---- Load hyperparameters (defaults -> optional config -> CLI overrides) ----
+    hparams = _load_hparams(args.config)
+
+    # CLI overrides
+    if args.epochs is not None:
+        hparams["epochs"] = int(args.epochs)
+    if args.batch_size is not None:
+        hparams["batch_size"] = int(args.batch_size)
+    if args.qat_start_epoch is not None:
+        hparams["qat_start_epoch"] = int(args.qat_start_epoch)
+    if args.lr is not None:
+        hparams["lr"] = float(args.lr)
+    if args.weight_decay is not None:
+        hparams["weight_decay"] = float(args.weight_decay)
+    if args.label_smoothing is not None:
+        hparams["label_smoothing"] = float(args.label_smoothing)
+    if args.kd_temp is not None:
+        hparams["kd_temp"] = float(args.kd_temp)
+    if args.kd_alpha is not None:
+        hparams["kd_alpha"] = float(args.kd_alpha)
+    if args.qat_backend is not None:
+        hparams["qat_backend"] = str(args.qat_backend)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist the effective hparams to output_dir for traceability
+    effective_cfg_path = output_dir / "effective_hparams.yaml"
+    if rank == 0:
+        with open(effective_cfg_path, "w") as f:
+            yaml.safe_dump(hparams, f, sort_keys=False)
 
     # ---- MLflow (rank 0 only) ----
     if rank == 0:
@@ -121,12 +197,13 @@ def main() -> None:
         mlflow.start_run(run_name="final_training")
         mlflow.log_params(hparams)
         mlflow.log_param("amp_pre_qat", int(args.amp))
+        mlflow.log_param("config_path", args.config or "NONE")
         mlflow.enable_system_metrics_logging()
-
         print("=" * 70)
         print("FINAL QAT TRAINING (DDP)")
         print("=" * 70)
         print(f"Hyperparameters: {hparams}")
+        print(f"Effective config written to: {effective_cfg_path}")
         print("=" * 70)
 
     # ---- Data ----
@@ -167,7 +244,6 @@ def main() -> None:
         persistent_workers=True,
     )
 
-    # For real INT8 eager quant eval (CPU)
     testloader_cpu = DataLoader(
         testset,
         batch_size=int(hparams["batch_size"]),
@@ -207,7 +283,6 @@ def main() -> None:
     else:
         ddp_model = model
 
-    # AMP scaler (new API). We will disable it once QAT starts.
     scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device.type == "cuda"))
 
     qat_enabled = False
@@ -242,12 +317,15 @@ def main() -> None:
 
         ddp_model.train()
 
-        # AMP only before QAT starts
         amp_enabled_this_epoch = bool(args.amp) and (not qat_enabled) and (device.type == "cuda")
 
         it = trainloader
         if rank == 0:
-            it = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs} (amp={int(amp_enabled_this_epoch)} qat={int(qat_enabled)})", leave=False)
+            it = tqdm(
+                trainloader,
+                desc=f"Epoch {epoch+1}/{epochs} (amp={int(amp_enabled_this_epoch)} qat={int(qat_enabled)})",
+                leave=False,
+            )
 
         running_loss = 0.0
         n_batches = 0
@@ -259,7 +337,6 @@ def main() -> None:
             with torch.no_grad():
                 teacher_out = teacher(images)
 
-            # autocast only pre-QAT
             with torch.amp.autocast("cuda", enabled=amp_enabled_this_epoch):
                 student_out = ddp_model(images)
 
@@ -337,7 +414,9 @@ def main() -> None:
         converted = output_dir / "best_converted.pth"
         if converted.exists():
             mlflow.log_artifact(str(converted), "models")
-        mlflow.log_artifact(str(args.config), "configs")
+        mlflow.log_artifact(str(effective_cfg_path), "configs")
+        if args.config:
+            mlflow.log_artifact(str(args.config), "configs")
         mlflow.end_run()
 
     if is_distributed:
