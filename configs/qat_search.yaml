@@ -1,0 +1,12 @@
+# project/configs/qat_search.yaml
+# Template config. Optuna writes best_params.yaml into output-dir.
+search:
+  trials: 30
+  epochs: 10
+  output_dir: ./qat_search
+  data_root: ./data
+  device: null
+
+final_train:
+  output_dir: ./qat_search
+  nproc_per_node: 4
