@@ -6,6 +6,7 @@ Produces deployable INT8 quantized model.
 Notes:
 - Eager QAT/convert are CPU-oriented for true int8 execution; we evaluate the converted model on CPU.
 - prepare_qat requires the model to be in train() mode.
+- AMP is supported pre-QAT only; AMP is disabled once QAT starts (fixes dtype issues with fake-quant).
 """
 
 from __future__ import annotations
@@ -79,6 +80,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Final QAT training with DDP")
     parser.add_argument("--config", type=str, required=True, help="Path to best_params.yaml")
     parser.add_argument("--output-dir", type=str, default="./qat_search", help="Output directory")
+
+    # Optional AMP for speed (pre-QAT only)
+    parser.add_argument("--amp", action="store_true", help="Enable AMP pre-QAT (disabled once QAT starts).")
+
+    # MLflow backend (recommend sqlite)
+    parser.add_argument("--mlflow-uri", type=str, default="sqlite:///mlflow.db")
+    parser.add_argument("--mlflow-exp", type=str, default="clue-vit-qat-final")
+
     args = parser.parse_args()
 
     # ---- DDP init (use LOCAL_RANK for GPU assignment) ----
@@ -107,11 +116,13 @@ def main() -> None:
 
     # ---- MLflow (rank 0 only) ----
     if rank == 0:
-        mlflow.set_tracking_uri(f"file://{os.path.abspath('./mlruns')}")
-        mlflow.set_experiment("clue-vit-qat-final")
+        mlflow.set_tracking_uri(args.mlflow_uri)
+        mlflow.set_experiment(args.mlflow_exp)
         mlflow.start_run(run_name="final_training")
         mlflow.log_params(hparams)
+        mlflow.log_param("amp_pre_qat", int(args.amp))
         mlflow.enable_system_metrics_logging()
+
         print("=" * 70)
         print("FINAL QAT TRAINING (DDP)")
         print("=" * 70)
@@ -172,13 +183,11 @@ def main() -> None:
     for p in teacher.parameters():
         p.requires_grad = False
 
-    # QAT wrapper student (QuantStub -> model -> DeQuantStub)
     model: nn.Module = model_registry.create_student("vit", num_classes=10, qat_wrapper=True).to(device)
 
     # ---- Losses ----
     criterion_ce = nn.CrossEntropyLoss(label_smoothing=float(hparams["label_smoothing"]))
     criterion_kd = nn.KLDivLoss(reduction="batchmean")
-
     kd_temp = float(hparams["kd_temp"])
     kd_alpha = float(hparams["kd_alpha"])
 
@@ -198,6 +207,9 @@ def main() -> None:
     else:
         ddp_model = model
 
+    # AMP scaler (new API). We will disable it once QAT starts.
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.amp and device.type == "cuda"))
+
     qat_enabled = False
     best_quant_acc = 0.0
 
@@ -214,32 +226,31 @@ def main() -> None:
             if rank == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Enabling QAT at epoch {epoch}")
 
-            # unwrap DDP -> prepare -> rewrap
             base = _unwrap_ddp(ddp_model)
-
-            # prepare_qat requires train mode
             base.train()
-
             base.qconfig = get_default_qat_qconfig(qbackend)
             prepared = prepare_qat(base, inplace=False).to(device)
             prepared.train()
 
-            # rewrap DDP for prepared model
             if is_distributed:
                 ddp_model = DDP(prepared, device_ids=[local_rank] if device.type == "cuda" else None)
             else:
                 ddp_model = prepared
 
-            # reduce lr when QAT starts
             optimizer = make_optimizer(ddp_model.parameters(), lr_scale=0.5)
-
             qat_enabled = True
 
         ddp_model.train()
 
+        # AMP only before QAT starts
+        amp_enabled_this_epoch = bool(args.amp) and (not qat_enabled) and (device.type == "cuda")
+
         it = trainloader
         if rank == 0:
-            it = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+            it = tqdm(trainloader, desc=f"Epoch {epoch+1}/{epochs} (amp={int(amp_enabled_this_epoch)} qat={int(qat_enabled)})", leave=False)
+
+        running_loss = 0.0
+        n_batches = 0
 
         for images, labels in it:
             images = images.to(device, non_blocking=True)
@@ -248,20 +259,32 @@ def main() -> None:
             with torch.no_grad():
                 teacher_out = teacher(images)
 
-            student_out = ddp_model(images)
+            # autocast only pre-QAT
+            with torch.amp.autocast("cuda", enabled=amp_enabled_this_epoch):
+                student_out = ddp_model(images)
 
-            loss_ce = criterion_ce(student_out, labels)
-            loss_kd = criterion_kd(
-                torch.log_softmax(student_out / kd_temp, dim=1),
-                torch.softmax(teacher_out / kd_temp, dim=1),
-            ) * (kd_temp**2)
+                loss_ce = criterion_ce(student_out, labels)
+                loss_kd = criterion_kd(
+                    torch.log_softmax(student_out / kd_temp, dim=1),
+                    torch.softmax(teacher_out / kd_temp, dim=1),
+                ) * (kd_temp**2)
 
-            loss = kd_alpha * loss_kd + (1.0 - kd_alpha) * loss_ce
+                loss = kd_alpha * loss_kd + (1.0 - kd_alpha) * loss_ce
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
-            optimizer.step()
+
+            if amp_enabled_this_epoch:
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
+                optimizer.step()
+
+            running_loss += float(loss.detach().item())
+            n_batches += 1
 
         if is_distributed:
             dist.barrier()
@@ -275,12 +298,10 @@ def main() -> None:
 
             if is_last:
                 base = _unwrap_ddp(ddp_model)
-                # convert expects eval mode
                 base.eval()
                 quant_model = convert(base, inplace=False)
                 quant_acc = evaluate_quantized_cpu(quant_model, testloader_cpu)
 
-            # Save best (based on quant_acc)
             if quant_acc > best_quant_acc:
                 best_quant_acc = quant_acc
                 base = _unwrap_ddp(ddp_model)
@@ -292,9 +313,11 @@ def main() -> None:
             print(
                 f"[{datetime.now().strftime('%H:%M:%S')}] "
                 f"Epoch {epoch+1:2d}/{epochs} | "
+                f"Loss: {running_loss/max(1,n_batches):.4f} | "
                 f"QAT Acc: {qat_acc:5.2f}% | Quant Acc: {quant_acc:5.2f}%"
             )
 
+            mlflow.log_metric("train_loss", running_loss / max(1, n_batches), step=epoch)
             mlflow.log_metric("qat_acc", qat_acc, step=epoch)
             if is_last:
                 mlflow.log_metric("quant_acc", quant_acc, step=epoch)
