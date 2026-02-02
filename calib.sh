@@ -1,16 +1,46 @@
 #!/usr/bin/env bash
-# [+] Done. Checkpoints available:
-#     /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz
-
-# Use with:
-#   bash calib.sh --data-dir <DATASET_ROOT> --ckpt-dir /mnt/manatee/irad/clue/checkpoints
-#   bash qat.sh   --data-dir <DATASET_ROOT> --ckpt-dir /mnt/manatee/irad/clue/checkpoints
-# (clue-dev) dinab@dgx3:~/qat-vit$ ./calib.sh --data-dir /mnt/manatee/irad/clue/imagenet1k/ --ckpt-dir /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz 
-# [ERROR] Missing pretrained: /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz/ViT-B_16.npz
-# (clue-dev) dinab@dgx3:~/qat-vit$ ls /mnt/manatee/irad/clue/checkpoints/
-# ViT-B_16.npz
+# (clue-dev) dinab@dgx3:~/qat-vit$ ./calib.sh --data-dir /mnt/manatee/irad/clue/imagenet1k/ --ckpt-dir /mnt/manatee/irad/clue/checkpoints/
+# [+] DATA_DIR=/mnt/manatee/irad/clue/imagenet1k/
+# [+] CKPT_DIR=/mnt/manatee/irad/clue/checkpoints/
+# [+] Using pretrained: /mnt/manatee/irad/clue/checkpoints//ViT-B_16.npz
+# Traceback (most recent call last):
+#   File "/home/dinab/qat-vit/main.py", line 29, in <module>
+#     from apex import amp
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/apex/__init__.py", line 13, in <module>
+#     from pyramid.session import UnencryptedCookieSessionFactoryConfig
+# ImportError: cannot import name 'UnencryptedCookieSessionFactoryConfig' from 'pyramid.session' (unknown location)
+# E0202 14:00:27.983000 3957034 torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 0 (pid: 3957105) of binary: /home/dinab/envs/clue-dev/bin/python3.10
+# Traceback (most recent call last):
+#   File "/home/dinab/envs/clue-dev/bin/torchrun", line 8, in <module>
+#     sys.exit(main())
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+#     return f(*args, **kwargs)
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/torch/distributed/run.py", line 991, in main
+#     run(args)
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/torch/distributed/run.py", line 982, in run
+#     elastic_launch(
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+#     return launch_agent(self._config, self._entrypoint, list(args))
+#   File "/home/dinab/envs/clue-dev/lib/python3.10/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+#     raise ChildFailedError(
+# torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+# ============================================================
+# main.py FAILED
+# ------------------------------------------------------------
+# Failures:
+#   <NO_OTHER_FAILURES>
+# ------------------------------------------------------------
+# Root Cause (first observed failure):
+# [0]:
+#   time      : 2026-02-02_14:00:27
+#   host      : dgx3
+#   rank      : 0 (local_rank: 0)
+#   exitcode  : 1 (pid: 3957105)
+#   error_file: <N/A>
+#   traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+# ============================================================
 # (clue-dev) dinab@dgx3:~/qat-vit$ 
-set -euo pipefail
+# set -euo pipefail
 
 DATA_DIR=""
 CKPT_DIR=""
