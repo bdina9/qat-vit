@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# [+] Done. Checkpoints available:
+#     /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz
+
+# Use with:
+#   bash calib.sh --data-dir <DATASET_ROOT> --ckpt-dir /mnt/manatee/irad/clue/checkpoints
+#   bash qat.sh   --data-dir <DATASET_ROOT> --ckpt-dir /mnt/manatee/irad/clue/checkpoints
+# (clue-dev) dinab@dgx3:~/qat-vit$ ./calib.sh --data-dir /mnt/manatee/irad/clue/imagenet1k/ --ckpt-dir /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz 
+# [ERROR] Missing pretrained: /mnt/manatee/irad/clue/checkpoints/ViT-B_16.npz/ViT-B_16.npz
+# (clue-dev) dinab@dgx3:~/qat-vit$ ls /mnt/manatee/irad/clue/checkpoints/
+# ViT-B_16.npz
+# (clue-dev) dinab@dgx3:~/qat-vit$ 
 set -euo pipefail
 
 DATA_DIR=""
