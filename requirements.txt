@@ -1,9 +1,0 @@
-# project/requirements.txt
-torch
-torchvision
-timm
-optuna
-mlflow
-pyyaml
-tqdm
-numpy
